@@ -409,6 +409,7 @@ class QwenVLBase:
 
     @staticmethod
     def tensor_to_pil(tensor):
+        """Convert tensor to PIL Image."""
         if tensor is None:
             return None
         if tensor.dim() == 4:
@@ -417,8 +418,88 @@ class QwenVLBase:
         return Image.fromarray(array)
     
     @staticmethod
+    def resize_tensor_gpu(tensor, max_resolution):
+        """Resize single tensor on GPU using bicubic interpolation."""
+        if max_resolution == 0 or tensor is None:
+            return tensor
+        
+        # Ensure tensor is on GPU
+        if not tensor.is_cuda and torch.cuda.is_available():
+            tensor = tensor.cuda()
+        
+        # tensor: [H, W, C]
+        if tensor.dim() == 3:
+            h, w, c = tensor.shape
+            # Convert to [C, H, W] for interpolate
+            tensor = tensor.permute(2, 0, 1)
+        else:
+            c, h, w = tensor.shape
+        
+        max_dim = max(h, w)
+        if max_dim <= max_resolution:
+            return tensor.permute(1, 2, 0) if tensor.dim() == 3 else tensor
+        
+        scale = max_resolution / max_dim
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        # Add batch dimension
+        tensor = tensor.unsqueeze(0)  # [1, C, H, W]
+        
+        # GPU resize with high quality
+        resized = torch.nn.functional.interpolate(
+            tensor,
+            size=(new_h, new_w),
+            mode='bicubic',
+            align_corners=False,
+            antialias=True
+        )
+        
+        resized = resized.squeeze(0)  # [C, H, W]
+        resized = resized.permute(1, 2, 0)  # Back to [H, W, C]
+        
+        return resized
+    
+    @staticmethod
+    def resize_batch_gpu(frames_tensor, max_resolution):
+        """Resize batch of frames in parallel on GPU."""
+        if max_resolution == 0 or frames_tensor is None:
+            return frames_tensor
+        
+        # Ensure on GPU
+        if not frames_tensor.is_cuda and torch.cuda.is_available():
+            frames_tensor = frames_tensor.cuda()
+        
+        # frames_tensor: [N, H, W, C]
+        N, H, W, C = frames_tensor.shape
+        
+        max_dim = max(H, W)
+        if max_dim <= max_resolution:
+            return frames_tensor
+        
+        scale = max_resolution / max_dim
+        new_h, new_w = int(H * scale), int(W * scale)
+        
+        # Convert to [N, C, H, W]
+        frames = frames_tensor.permute(0, 3, 1, 2)
+        
+        # Batch GPU resize!
+        resized = torch.nn.functional.interpolate(
+            frames,
+            size=(new_h, new_w),
+            mode='bicubic',
+            align_corners=False,
+            antialias=True
+        )
+        
+        # Back to [N, H, W, C]
+        resized = resized.permute(0, 2, 3, 1)
+        
+        print(f"[QwenVL] GPU Batch Resize: {N} frames {W}x{H} → {new_w}x{new_h}")
+        return resized
+    
+    @staticmethod
     def resize_image(pil_image, max_resolution):
-        """Resize PIL image if larger than max_resolution, maintaining aspect ratio."""
+        """Legacy CPU resize for compatibility."""
         if max_resolution == 0 or pil_image is None:
             return pil_image
         
@@ -426,16 +507,14 @@ class QwenVLBase:
         max_dim = max(w, h)
         
         if max_dim <= max_resolution:
-            return pil_image  # No resize needed
+            return pil_image
         
-        # Calculate new size maintaining aspect ratio
         scale = max_resolution / max_dim
         new_w = int(w * scale)
         new_h = int(h * scale)
         
-        # Use high-quality LANCZOS resampling
         resized = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        print(f"[QwenVL] Resized {w}x{h} → {new_w}x{new_h} (max_resolution={max_resolution})")
+        print(f"[QwenVL] CPU Resize: {w}x{h} → {new_w}x{new_h} (max_resolution={max_resolution})")
         return resized
 
     @torch.no_grad()
@@ -452,6 +531,12 @@ class QwenVLBase:
         repetition_penalty,
         max_resolution=0,
     ):
+        import time
+        t_start = time.time()
+        timings = {}
+        
+        # Step 1: Preprocessing
+        t1 = time.time()
         conversation = [{"role": "user", "content": []}]
         if image is not None:
             pil_img = self.tensor_to_pil(image)
@@ -467,6 +552,10 @@ class QwenVLBase:
             if frames:
                 conversation[0]["content"].append({"type": "video", "video": frames})
         conversation[0]["content"].append({"type": "text", "text": prompt_text})
+        timings['preprocessing'] = time.time() - t1
+        
+        # Step 2: Tokenization
+        t2 = time.time()
         chat = self.processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
         images = [item["image"] for item in conversation[0]["content"] if item["type"] == "image"]
         video_frames = [frame for item in conversation[0]["content"] if item["type"] == "video" for frame in item["video"]]
@@ -477,6 +566,10 @@ class QwenVLBase:
             key: value.to(model_device) if torch.is_tensor(value) else value
             for key, value in processed.items()
         }
+        timings['tokenization'] = time.time() - t2
+        
+        # Step 3: Model Inference
+        t3 = time.time()
         stop_tokens = [self.tokenizer.eos_token_id]
         if hasattr(self.tokenizer, "eot_id") and self.tokenizer.eot_id is not None:
             stop_tokens.append(self.tokenizer.eot_id)
@@ -494,8 +587,23 @@ class QwenVLBase:
         outputs = self.model.generate(**model_inputs, **kwargs)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        timings['inference'] = time.time() - t3
+        
+        # Step 4: Post-processing  
+        t4 = time.time()
         input_len = model_inputs["input_ids"].shape[-1]
         text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
+        timings['postprocessing'] = time.time() - t4
+        
+        # Print performance breakdown
+        total_time = time.time() - t_start
+        print(f"\n[QwenVL Performance Breakdown]")
+        print(f"  Total Time: {total_time:.2f}s")
+        for step, duration in timings.items():
+            pct = (duration / total_time) * 100
+            print(f"  - {step.capitalize():15s}: {duration:6.2f}s ({pct:5.1f}%)")
+        print("")
+        
         return text.strip()
 
     def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, max_resolution=0):
