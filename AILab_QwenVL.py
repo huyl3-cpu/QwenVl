@@ -53,7 +53,7 @@ TOOLTIPS = {
     "num_beams": "Beam-search width. Values >1 disable temperature/top_p and trade speed for more stable answers.",
     "repetition_penalty": "Values >1 (e.g., 1.1–1.3) penalize repeated phrases; 1.0 leaves logits untouched.",
     "frame_count": "Number of frames extracted from video inputs before prompting Qwen-VL. More frames provide context but cost time.",
-    "batch_size": "Process multiple frames/images in parallel batches. Higher values (2-8) increase GPU utilization and speed but require more VRAM. Use 1 for single image or low VRAM.",
+    "batch_size": "[EXPERIMENTAL] Batch size for processing. NOTE: Current Qwen-VL treats video as sequence (not parallel batches). For multi-image workflows, higher values (8-64) increase GPU util. Single video: keep at 1.",
 }
 
 class Quantization(str, Enum):
@@ -561,8 +561,9 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8, "tooltip": TOOLTIPS["num_beams"]}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 64, "tooltip": TOOLTIPS["frame_count"]}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 16, "tooltip": TOOLTIPS["batch_size"]}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "tooltip": TOOLTIPS["batch_size"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
+                "use_torch_compile": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["use_torch_compile"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {
