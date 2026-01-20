@@ -54,6 +54,7 @@ TOOLTIPS = {
     "repetition_penalty": "Values >1 (e.g., 1.1–1.3) penalize repeated phrases; 1.0 leaves logits untouched.",
     "frame_count": "Number of frames extracted from video inputs before prompting Qwen-VL. More frames provide context but cost time.",
     "batch_size": "[EXPERIMENTAL] Batch size for processing. NOTE: Current Qwen-VL treats video as sequence (not parallel batches). For multi-image workflows, higher values (8-64) increase GPU util. Single video: keep at 1.",
+    "max_resolution": "Max resolution for preprocessing. Images/videos larger than this will be resized (bicubic). 0=disable, 720=fast, 1080=balanced, 1920=quality. Saves ~50% time for 4K inputs.",
 }
 
 class Quantization(str, Enum):
@@ -414,6 +415,28 @@ class QwenVLBase:
             tensor = tensor[0]
         array = (tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         return Image.fromarray(array)
+    
+    @staticmethod
+    def resize_image(pil_image, max_resolution):
+        """Resize PIL image if larger than max_resolution, maintaining aspect ratio."""
+        if max_resolution == 0 or pil_image is None:
+            return pil_image
+        
+        w, h = pil_image.size
+        max_dim = max(w, h)
+        
+        if max_dim <= max_resolution:
+            return pil_image  # No resize needed
+        
+        # Calculate new size maintaining aspect ratio
+        scale = max_resolution / max_dim
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Use high-quality LANCZOS resampling
+        resized = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        print(f"[QwenVL] Resized {w}x{h} → {new_w}x{new_h} (max_resolution={max_resolution})")
+        return resized
 
     @torch.no_grad()
     def generate(
@@ -427,15 +450,20 @@ class QwenVLBase:
         top_p,
         num_beams,
         repetition_penalty,
+        max_resolution=0,
     ):
         conversation = [{"role": "user", "content": []}]
         if image is not None:
-            conversation[0]["content"].append({"type": "image", "image": self.tensor_to_pil(image)})
+            pil_img = self.tensor_to_pil(image)
+            pil_img = self.resize_image(pil_img, max_resolution)
+            conversation[0]["content"].append({"type": "image", "image": pil_img})
         if video is not None:
             frames = [self.tensor_to_pil(frame) for frame in video]
             if len(frames) > frame_count:
                 idx = np.linspace(0, len(frames) - 1, frame_count, dtype=int)
                 frames = [frames[i] for i in idx]
+            # Apply resize to all frames
+            frames = [self.resize_image(f, max_resolution) for f in frames]
             if frames:
                 conversation[0]["content"].append({"type": "video", "video": frames})
         conversation[0]["content"].append({"type": "text", "text": prompt_text})
@@ -470,7 +498,7 @@ class QwenVLBase:
         text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
         return text.strip()
 
-    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device):
+    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, max_resolution=0):
         torch.manual_seed(seed)
         prompt = SYSTEM_PROMPTS.get(preset_prompt, preset_prompt)
         if custom_prompt and custom_prompt.strip():
@@ -494,6 +522,7 @@ class QwenVLBase:
                 top_p,
                 num_beams,
                 repetition_penalty,
+                max_resolution,
             )
             return (text,)
         finally:
@@ -561,6 +590,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8, "tooltip": TOOLTIPS["num_beams"]}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 64, "tooltip": TOOLTIPS["frame_count"]}),
+                "max_resolution": ("INT", {"default": 0, "min": 0, "max": 3840, "step": 64, "tooltip": TOOLTIPS["max_resolution"]}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "tooltip": TOOLTIPS["batch_size"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "use_torch_compile": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["use_torch_compile"]}),
@@ -577,10 +607,10 @@ class AILab_QwenVL_Advanced(QwenVLBase):
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
-    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, batch_size, keep_model_loaded, seed, image=None, video=None):
+    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, max_resolution, batch_size, keep_model_loaded, seed, image=None, video=None):
         if batch_size > 1:
             print(f"[QwenVL] Batch size={batch_size} requested. Note: Current implementation processes sequentially. Future update will implement true batching for maximum GPU utilization.")
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device)
+        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, max_resolution)
 
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL": AILab_QwenVL,
