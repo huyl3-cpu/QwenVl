@@ -52,8 +52,8 @@ TOOLTIPS = {
     "top_p": "Nucleus sampling cutoff when num_beams == 1. Lower values keep only top tokens; 0.9–0.95 allows more variety.",
     "num_beams": "Beam-search width. Values >1 disable temperature/top_p and trade speed for more stable answers.",
     "repetition_penalty": "Values >1 (e.g., 1.1–1.3) penalize repeated phrases; 1.0 leaves logits untouched.",
-    "frame_count": "Number of frames extracted from video inputs before prompting Qwen-VL. More frames provide context but cost time.",
-    "batch_size": "[EXPERIMENTAL] Batch size for processing. NOTE: Current Qwen-VL treats video as sequence (not parallel batches). For multi-image workflows, higher values (8-64) increase GPU util. Single video: keep at 1.",
+    "frame_count": "Number of frames extracted from video inputs. More frames = better context but more VRAM/time. Start with 16, increase cautiously. A100 80GB can handle 128+.",
+    "batch_size": "[ADVANCED] For future batching support. Currently no effect for single video. Keep at 1 unless experimenting. High values may cause OOM!",
     "max_resolution": "Max resolution for preprocessing. Images/videos larger than this will be resized (bicubic). 0=disable, 720=fast, 1080=balanced, 1920=quality. Saves ~50% time for 4K inputs.",
 }
 
@@ -589,9 +589,9 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "tooltip": TOOLTIPS["top_p"]}),
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8, "tooltip": TOOLTIPS["num_beams"]}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
-                "frame_count": ("INT", {"default": 16, "min": 1, "max": 64, "tooltip": TOOLTIPS["frame_count"]}),
+                "frame_count": ("INT", {"default": 16, "min": 1, "max": 9999, "tooltip": TOOLTIPS["frame_count"]}),
                 "max_resolution": ("INT", {"default": 0, "min": 0, "max": 3840, "step": 64, "tooltip": TOOLTIPS["max_resolution"]}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "tooltip": TOOLTIPS["batch_size"]}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 9999, "tooltip": TOOLTIPS["batch_size"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "use_torch_compile": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["use_torch_compile"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
