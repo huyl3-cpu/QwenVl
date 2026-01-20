@@ -11,6 +11,7 @@ Pillow
 opencv-python
 bitsandbytes
 accelerate
+sageattention>=2.2.0
 
 # For running GGUF models with vision support
 

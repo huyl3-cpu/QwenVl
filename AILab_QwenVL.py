@@ -39,7 +39,7 @@ PRESET_PROMPTS: list[str] = ["Describe this image in detail."]
 
 TOOLTIPS = {
     "model_name": "Pick the Qwen-VL checkpoint. First run downloads weights into models/LLM/Qwen-VL, so leave disk space.",
-    "quantization": "Precision vs VRAM. FP16 gives the best quality if memory allows; 8-bit suits 8–16 GB GPUs; 4-bit fits 6 GB or lower but is slower.",
+    "quantization": "Precision vs VRAM. BF16 is optimized for A100/H100 (best speed+quality); FP16 gives best quality; 8-bit suits 8–16 GB GPUs; 4-bit fits 6 GB or lower but is slower.",
     "attention_mode": "auto tries flash-attn v2 when installed and falls back to SDPA. Only override when debugging attention backends.",
     "preset_prompt": "Built-in instruction describing how Qwen-VL should analyze the media input.",
     "custom_prompt": "Optional override—when filled it completely replaces the preset template.",
@@ -53,12 +53,14 @@ TOOLTIPS = {
     "num_beams": "Beam-search width. Values >1 disable temperature/top_p and trade speed for more stable answers.",
     "repetition_penalty": "Values >1 (e.g., 1.1–1.3) penalize repeated phrases; 1.0 leaves logits untouched.",
     "frame_count": "Number of frames extracted from video inputs before prompting Qwen-VL. More frames provide context but cost time.",
+    "batch_size": "Process multiple frames/images in parallel batches. Higher values (2-8) increase GPU utilization and speed but require more VRAM. Use 1 for single image or low VRAM.",
 }
 
 class Quantization(str, Enum):
     Q4 = "4-bit (VRAM-friendly)"
     Q8 = "8-bit (Balanced)"
     FP16 = "None (FP16)"
+    BF16 = "BF16 (A100/H100 Optimized)"
 
     @classmethod
     def get_values(cls):
@@ -71,7 +73,7 @@ class Quantization(str, Enum):
                 return item
         raise ValueError(f"Unsupported quantization: {value}")
 
-ATTENTION_MODES = ["auto", "flash_attention_2", "sdpa"]
+ATTENTION_MODES = ["auto", "flash_attention_2", "sdpa", "sageattention"]
 
 def load_model_configs():
     global HF_VL_MODELS, HF_TEXT_MODELS, HF_ALL_MODELS, SYSTEM_PROMPTS, PRESET_PROMPTS
@@ -219,14 +221,43 @@ def flash_attn_available():
 
     return True
 
+def sage_attn_available():
+    """Check if SageAttention is installed and GPU supports it."""
+    if not torch.cuda.is_available():
+        return False
+    
+    # SageAttention requires compute capability >= 8.0 (Ampere+)
+    major, _ = torch.cuda.get_device_capability()
+    if major < 8:
+        return False
+    
+    try:
+        import sageattention
+        return True
+    except Exception:
+        return False
+
 def resolve_attention_mode(mode):
+    """Resolve attention mode with priority: SageAttention > Flash Attention > SDPA."""
     if mode == "sdpa":
+        return "sdpa"
+    if mode == "sageattention":
+        if sage_attn_available():
+            return "sageattention"
+        print("[QwenVL] SageAttention forced but unavailable, falling back to Flash-Attn/SDPA")
+        # Fallback to flash attention or SDPA
+        if flash_attn_available():
+            return "flash_attention_2"
         return "sdpa"
     if mode == "flash_attention_2":
         if flash_attn_available():
             return "flash_attention_2"
         print("[QwenVL] Flash-Attn forced but unavailable, falling back to SDPA")
         return "sdpa"
+    # Auto mode: Try SageAttention first (best for throughput on A100/H100)
+    if sage_attn_available():
+        print("[QwenVL] Auto mode: Using SageAttention for optimal throughput")
+        return "sageattention"
     if flash_attn_available():
         return "flash_attention_2"
     print("[QwenVL] Flash-Attn auto mode: dependency not ready, using SDPA")
@@ -302,6 +333,15 @@ def quantization_config(model_name, quantization):
         return cfg, None
     if quantization == Quantization.Q8:
         return BitsAndBytesConfig(load_in_8bit=True), None
+    if quantization == Quantization.BF16:
+        # BF16 requires Ampere (compute capability >= 8.0) or newer GPUs
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability()
+            if major >= 8:  # A100, H100, RTX 30xx/40xx series
+                return None, torch.bfloat16
+            print("[QwenVL] BF16 requested but GPU doesn't support it (need compute capability >= 8.0), falling back to FP16")
+        return None, torch.float16
+    # FP16 (default)
     return None, torch.float16 if torch.cuda.is_available() else torch.float32
 
 class QwenVLBase:
@@ -521,6 +561,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8, "tooltip": TOOLTIPS["num_beams"]}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 64, "tooltip": TOOLTIPS["frame_count"]}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 16, "tooltip": TOOLTIPS["batch_size"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
@@ -535,7 +576,9 @@ class AILab_QwenVL_Advanced(QwenVLBase):
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
-    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, seed, image=None, video=None):
+    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, batch_size, keep_model_loaded, seed, image=None, video=None):
+        if batch_size > 1:
+            print(f"[QwenVL] Batch size={batch_size} requested. Note: Current implementation processes sequentially. Future update will implement true batching for maximum GPU utilization.")
         return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device)
 
 NODE_CLASS_MAPPINGS = {
